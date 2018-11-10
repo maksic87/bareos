@@ -680,6 +680,12 @@ int chunked_device::SetupChunk(const char *pathname, int flags, int mode)
       return -1;
    }
 
+   if (!CheckRemote()) {
+      Dmsg0(100, "setup_chunk failed, as remote device is not available\n");
+      dev_errno = EIO; /**< I/O error */
+      return -1;
+   }
+
    if (!current_chunk_) {
       current_chunk_ = (chunk_descriptor *)malloc(sizeof(chunk_descriptor));
       memset(current_chunk_, 0, sizeof(chunk_descriptor));
@@ -742,13 +748,13 @@ int chunked_device::SetupChunk(const char *pathname, int flags, int mode)
     * but we need a secure way to determine,
     * if the chunk already exists.
     */
-   if (load_chunk()) {
-      m_current_chunk->opened = true;
+   if (LoadChunk()) {
+      current_chunk_->opened = true;
       retval = 0;
    } else if (flags & O_CREAT) {
       /* create a chunk */
-      if (flush_chunk(false /* release */, false /* move_to_next_chunk */)) {
-         m_current_chunk->opened = true;
+      if (FlushChunk(false /* release */, false /* move_to_next_chunk */)) {
+         current_chunk_->opened = true;
          retval = 0;
       }
    }
@@ -1017,7 +1023,7 @@ bail_out:
 /*
  * Close a chunked volume.
  */
-int chunked_device::close_chunk()
+int chunked_device::CloseChunk()
 {
    int retval = -1;
 
@@ -1035,9 +1041,9 @@ int chunked_device::close_chunk()
           * but not released. Therefore the buffer is set to NULL,
           * as normally done by flush_chunk(true, *).
           */
-         if (m_io_threads && m_current_chunk->buffer) {
-            free_chunkbuffer(m_current_chunk->buffer);
-            m_current_chunk->buffer = NULL;
+         if (io_threads_ && current_chunk_->buffer) {
+            FreeChunkbuffer(current_chunk_->buffer);
+            current_chunk_->buffer = NULL;
          }
          retval = 0;
       }
@@ -1189,6 +1195,88 @@ ssize_t chunked_device::ChunkedVolumeSize()
     */
    return chunked_remote_volume_size();
 }
+
+bool chunked_device::is_written()
+{
+   /*
+    * See if we are using io-threads or not and the ordered circbuf is created.
+    * We try to make sure that nothing of the volume being requested is still inflight as then
+    * the chunked_remote_volume_size() method will fail to determine the size of the data as
+    * its not fully stored on the backing store yet.
+    */
+
+   if (current_chunk_->need_flushing) {
+      Dmsg1(100, "volume %s is pending, as current chunk needs flushing\n", current_volname_);
+      return false;
+   }
+
+   /*
+    * Make sure there is also nothing inflight to the backing store anymore.
+    */
+   int inflight_chunks = NrInflightChunks();
+   if (inflight_chunks > 0) {
+      Dmsg2(100, "volume %s is pending, as there are %d inflight chunks\n", current_volname_, inflight_chunks);
+      return false;
+   }
+
+   if (io_threads_ > 0 && cb_) {
+
+      if (!cb_->empty()) {
+
+         chunk_io_request *request;
+
+         /*
+          * Peek on the ordered circular queue if there are any pending IO-requests
+          * for this volume. If there are use that as the indication of the size of
+          * the volume and don't contact the remote storage as there is still data
+          * inflight and as such we need to look at the last chunk that is still not
+          * uploaded of the volume.
+          */
+         request = (chunk_io_request *)cb_->peek(PEEK_FIRST, current_volname_, CompareVolumeName);
+         if (request) {
+            free(request);
+            Dmsg1(100, "volume %s is pending, as there are queued write requests\n", current_volname_);
+            return false;
+         }
+      }
+   }
+
+   /* compare expected to written volume size */
+   ssize_t remote_volume_size = chunked_remote_volume_size();
+   Dmsg3(100, "volume: %s, chunked_remote_volume_size = %lld, VolCatInfo.VolCatBytes = %lld\n",
+         current_volname_, remote_volume_size, VolCatInfo.VolCatBytes);
+
+   if (remote_volume_size < VolCatInfo.VolCatBytes) {
+      Dmsg3(100, "volume %s is pending, as 'remote volume size' = %lld < 'catalog volume size' = %lld\n",
+            current_volname_, remote_volume_size, VolCatInfo.VolCatBytes);
+      return false;
+   }
+
+   return true;
+}
+
+
+/*
+ * Busy waits until write buffer is empty.
+ */
+bool chunked_device::WaitUntilChunksWritten()
+{
+   bool retval = true;
+
+   if (current_chunk_->need_flushing) {
+      if (!FlushChunk(false /* release */, false /* move_to_next_chunk */)) {
+         dev_errno = EIO;
+         retval = false;
+      }
+   }
+
+   while (!is_written()) {
+      Bmicrosleep(DEFAULT_RECHECK_INTERVAL_WRITE_BUFFER, 0);
+   }
+
+   return retval;
+}
+
 
 static int CloneIoRequest(void *item1, void *item2)
 {
@@ -1345,12 +1433,23 @@ bool chunked_device::DeviceStatus(bsdDevStatTrig *dst)
     * See if we are using io-threads or not and the ordered CircularBuffer is created and not empty.
     */
    bool pending = false;
-   POOL_MEM inflights(PM_MESSAGE);
+   PoolMem inflights(PM_MESSAGE);
 
    dst->status_length = 0;
+   if (CheckRemote()) {
+      dst->status_length = PmStrcpy(dst->status, _("Backend connection is working.\n"));
+   } else {
+      dst->status_length = PmStrcpy(dst->status, _("Backend connection is not working.\n"));
+   }
    if (io_threads_ > 0 && cb_) {
+      if (NrInflightChunks() > 0) {
+         pending = true;
+         inflights.bsprintf("Inflight chunks: %d\n", NrInflightChunks());
+         dst->status_length = PmStrcat(dst->status, inflights.c_str());
+      }
       if (!cb_->empty()) {
-         dst->status_length = PmStrcpy(dst->status, _("Pending IO flush requests:\n"));
+         pending = true;
+         dst->status_length = PmStrcat(dst->status, _("Pending IO flush requests:\n"));
 
          /*
           * Peek on the ordered circular queue and list all pending requests.
@@ -1362,7 +1461,7 @@ bool chunked_device::DeviceStatus(bsdDevStatTrig *dst)
    }
 
    if (!pending) {
-      dst->status_length += pm_strcat(dst->status, _("No Pending IO flush requests.\n"));
+      dst->status_length += PmStrcat(dst->status, _("No Pending IO flush requests.\n"));
    }
 
    return (dst->status_length > 0);

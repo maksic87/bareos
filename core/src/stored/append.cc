@@ -328,7 +328,7 @@ fi_checked:
    /*
     * Release the device -- and send final Vol info to DIR and unlock it.
     */
-   release_device(dcr);
+   ReleaseDevice(dcr);
 
    /*
     * Don't use time_t for job_elapsed as time_t can be 32 or 64 bits,
