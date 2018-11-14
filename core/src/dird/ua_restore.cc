@@ -1556,6 +1556,9 @@ static int JobidFileindexHandler(void *ctx, int num_fields, char **row)
    AddFindex(rx->bsr, rx->JobId, str_to_int64(row[1]));
    rx->found = true;
    rx->selected_files++;
+
+   JobidHandler(ctx, num_fields, row);
+
    return 0;
 }
 
